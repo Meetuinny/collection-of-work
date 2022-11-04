@@ -1,0 +1,399 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warning = FALSE, comment = FALSE, error = FALSE, message = FALSE)
+```
+
+```{r cars}
+library(lubridate)
+library(tidyverse)
+library(MASS)
+library(broom)
+library(mgcv)
+library(RcppRoll)
+library(dplyr)
+library(skimr)
+library(magrittr)
+library(zoo)
+```
+
+#### Import dataset
+```{r pressure, echo=FALSE}
+vic_weather <- read.csv("vic_weather.csv")
+```
+
+#### Preprocess the car_accident_victoria dataset 
+```{r}
+# Clean up the column names
+cav_data_link <- "/Users/merry/Documents/Deakin - Master of Data Science/T2 2022/SIT741/Assessments/A3/car_accidents_victoria.csv"
+top_row <- read_csv(cav_data_link, col_names = FALSE, n_max = 1)
+second_row <- read_csv(cav_data_link, n_max = 1)
+
+column_names <- second_row %>%
+  unlist(., use.names = FALSE) %>%
+  make.unique(., sep = "__") # double underscore
+
+column_names[2:5] <- str_c(column_names[2:5], '0', sep='__')
+
+daily_accidents <-
+  read_csv(cav_data_link, skip = 2, col_names = column_names)
+```
+
+```{r eval=TRUE}
+# Get the regions
+(
+regions <- top_row %>% 
+  unlist(., use.names=FALSE) %>% 
+  na.omit()
+)
+```
+
+#### Transform dataset into tidy data
+```{r}
+daily_accidents <- daily_accidents %>% 
+  gather(key = index, 
+         value = value, 
+         -DATE)
+```
+
+```{r}
+# Put data from the same measurement source in a column and put each observation in a row
+daily_accidents <- daily_accidents %>% 
+  separate(index, 
+           into = c("index", 
+                    "region_id"), 
+           sep="__", 
+           remove=TRUE) %>% 
+  mutate(region_id = 
+           as.numeric(region_id) + 1) %>% 
+  mutate(region_name = 
+           regions[region_id]) %>% 
+  dplyr::select(DATE, 
+         region_name, 
+         index, 
+         value)
+```
+
+```{r}
+# Replacing N/a values with the mode 
+getmode <- function(v) {
+   v <- na.omit(v)
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+
+daily_accidents <- daily_accidents %>% 
+  mutate(value = 
+           as.numeric(value))
+
+daily_accidents <- daily_accidents %>% 
+  mutate(value = replace_na(value, getmode(value)))
+
+
+daily_accidents <- daily_accidents %>% 
+  spread(index, 
+         value)
+```
+
+```{r}
+daily_accidents <- daily_accidents %>% 
+  mutate(DATE = dmy(DATE))
+```
+
+#### Select a region for the following analysis
+```{r}
+selected_region <- "METROPOLITAN NORTH WEST REGION"
+
+one_region <- daily_accidents %>%
+  filter(region_name == selected_region) %>% 
+  dplyr::select(-region_name) %>% 
+  arrange(DATE)
+
+one_region %>% 
+  summarise(total_accidents = sum(SERIOUS)+sum(FATAL)+sum(NOINJURY)+sum(OTHER), 
+            serious_accidents = sum(SERIOUS))
+
+one_region <- one_region %>%
+  mutate(TOTAL_ACCIDENTS = FATAL + SERIOUS + NOINJURY + OTHER)
+
+one_region
+```
+
+```{r}
+one_region <- transform(one_region, 
+                        ndate = as.numeric(DATE),
+                        nyear  = as.numeric(format(DATE, '%Y')),
+                        nmonth = as.numeric(format(DATE, '%m')),
+                        day = as.numeric(format(DATE, '%j')))
+str(one_region)
+```
+
+#### Fit a Poisson distribution and a negative binomial distribution on the sample of total accidents
+```{r}
+region_sample <- sample_n(one_region, 200)
+
+fit_P <- fitdist(region_sample$TOTAL_ACCIDENTS, "pois")
+
+fit_NB <- fitdist(region_sample$TOTAL_ACCIDENTS, "nbinom")
+
+denscomp(list(fit_P, fit_NB))
+
+cdfcomp(list(fit_P, fit_NB))
+
+print(region_sample$TOTAL_ACCIDENTS)
+
+```
+
+#### Compare the log-likelihood of two fitted distributions.
+```{r}
+one_region %>% 
+  ggplot(aes(sample = TOTAL_ACCIDENTS)) +
+  stat_qq(distribution = stats::qnbinom, dparams = fit_NB$estimate) +
+  stat_qq_line(distribution = stats::qnbinom, dparams = fit_NB$estimate)
+```
+```{r}
+fit_P$loglik
+fit_NB$loglik
+```
+
+#### Fit a linear model for road traffic accident using date as the predictor variable
+```{r}
+# We can first plot the total accidents number against the date of a year (day)
+one_region %>% 
+  ggplot(aes(x = day, 
+             y = TOTAL_ACCIDENTS)) +
+  geom_point() +
+  geom_smooth(method = 'lm')
+```
+
+```{r}
+# Then, fit the linear model and assess the model fit
+model_lm <- lm(TOTAL_ACCIDENTS ~ day,
+               data = one_region)
+model_lm
+```
+
+```{r}
+# Obtain model fitting summary
+model_lm %>%
+  summary
+```
+
+```{r}
+model_lm %>%
+  glance
+```
+
+#### Plot the fitted values and the residuals
+```{r}
+results <- model_lm %>%
+  augment
+```
+
+```{r}
+results %>% 
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_point() + 
+  geom_smooth(colour = 'firebrick') 
+```
+
+#### Fit a generalised additive model (GAM)
+```{r}
+model_gam <- gam(TOTAL_ACCIDENTS ~ s(day), data = one_region, method = "REML")
+model_gam
+```
+
+```{r}
+summary(model_gam)
+```
+
+```{r}
+# Plot the partial effective scatter plot
+plot(model_gam,seWithMean = TRUE, residuals = TRUE, shift = coef(model_gam)[1])
+```
+
+```{r}
+par(mfrow = c(2, 2))
+gam.check(model_gam)
+```
+
+#### Augment the model to incorporate the weekly variations
+#### Investigate the weekly pattern 
+```{r}
+week_mnw <- one_region %>%
+  mutate(WEEK = wday(DATE, label = TRUE))
+
+week_mnw %>%
+  ggplot(aes(x = WEEK,
+             y = TOTAL_ACCIDENTS)) +
+  geom_violin() +
+  geom_boxplot(width = 0.2)
+```
+
+```{r}
+week_mnw %>%
+  ggplot(aes(x = DATE, y = TOTAL_ACCIDENTS, colour = factor(WEEK))) + 
+  geom_line()
+```
+
+#### Fit the new model with weekly variations
+```{r}
+model_gam_week <- gam(TOTAL_ACCIDENTS ~ s(ndate, by = WEEK) + WEEK, data = week_mnw)
+model_gam_week
+```
+
+#### Use plots to see the fitted smooth functions
+```{r}
+par(mfrow = c(2, 3))
+plot(model_gam_week, shade = TRUE, shade.col = "lightblue")
+```
+
+#### Evaluate the model after incorporating weekly variations
+```{r}
+summary(model_gam_week)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+gam.check(model_gam_week)
+```
+
+#### Compare the models using AIC
+```{r}
+AIC(model_lm, model_gam, model_gam_week)
+```
+
+```{r}
+print("Linear Model:")
+coef(model_lm)
+print("GAM Model:")
+coef(model_gam)
+print("GAM Model with weekly variations:")
+coef(model_gam_week)
+```
+
+```{r}
+anova(model_gam, model_gam_week)
+```
+
+### Heatwaves, precipitation and road traffic accidents
+
+#### Use the NOAA data to calculate the dialy EHF and plot the daily values
+```{r}
+# Calculate the average temperature of the day using min-max values
+vic_ehf <- vic_weather %>%
+  mutate(TMEAN = (TMAX + TMIN)/2)
+```
+
+```{r}
+# Add the columns of three-day-average DMT and average DMT over the recent past (30 days)
+mnw_ehf <- vic_ehf %>%
+  mutate(t_3d_after = roll_meanr(lead(TMEAN), 3)) %>%
+  mutate(t_30d_before = roll_meanr(lag(TMEAN), 30))
+```
+
+```{r}
+# Calculate T95 for each year and add the value to the dataset
+mnw_ehf <- transform(mnw_ehf, nyear = as.numeric(format(DATE, '%Y')))
+
+t95 <- mnw_ehf %>%
+  group_by(nyear) %>%
+  summarise(t_95 = quantile(TMEAN, probs = 0.95, na.rm = TRUE))
+  
+mnw_ehf <- merge(mnw_ehf, t95, by = "nyear")
+```
+
+```{r}
+# Calculate the EHI
+mnw_ehf <- mnw_ehf %>%
+  mutate(EHIsig = t_3d_after - t_95) %>%
+  mutate(EHIaccl = t_3d_after - t_30d_before) %>%
+  mutate(EHF = EHIsig * pmax(1, EHIaccl))
+```
+
+```{r}
+# Plot the daily EHI
+mnw_ehf %>%
+  ggplot(aes(x=DATE, 
+             y=EHF)) + 
+  geom_line() + 
+  ylab("Excess Heat Factor (EHF)")
+```
+
+#### Use the EHF as an additional predictor to augment the models
+```{r}
+# Make a new dataframe for the GAM model fit
+mnw_ehf <- mnw_ehf %>%
+  mutate(WEEK = wday(DATE, label = TRUE))
+
+mnw_ehf_cb <- merge(mnw_ehf, week_mnw, by = c("DATE", "nyear", "WEEK"))
+```
+
+```{r}
+# Fit the GAM model with weekly variation and EHF predictors
+model_gam_ehf <- gam(TOTAL_ACCIDENTS ~ s(ndate, by = WEEK) + WEEK + s(EHF), data = mnw_ehf_cb)
+model_gam_ehf
+```
+
+```{r}
+summary(model_gam_ehf)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+gam.check(model_gam_ehf)
+```
+```{r}
+# Plot the results
+par(mfrow = c(2, 4))
+plot(model_gam_ehf, shade = TRUE, shade.col = "lightblue")
+```
+```{r}
+# Use the shift argument to shift the scale for an interpretable purpose. 
+plot(model_gam_ehf, seWithMean = TRUE, shade = TRUE, shade.col = "lightblue", shift = coef(model_gam_ehf)[1])
+```
+
+```{r}
+# Compare AIC scores of the all the models
+AIC(model_lm, model_gam, model_gam_week, model_gam_ehf)
+```
+
+#### Use extra weather features for the mode
+```{r}
+# Fit the model with daily minimum and maximum temperature
+model_gam_minmax<- gam(TOTAL_ACCIDENTS ~ s(ndate, by = WEEK) + WEEK + te(TMIN, TMAX), data = mnw_ehf_cb)
+model_gam_minmax
+```
+
+```{r}
+# Fit the model with daily precipitation
+model_gam_prcp <- gam(TOTAL_ACCIDENTS ~ s(ndate, by = WEEK) + WEEK + s(EHF) + s(TAVG) + PRCP, data = mnw_ehf_cb)
+model_gam_prcp
+```
+
+```{r}
+summary(model_gam_minmax)
+```
+
+```{r}
+summary(model_gam_prcp)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+gam.check(model_gam_minmax)
+```
+
+```{r}
+par(mfrow = c(2, 2))
+gam.check(model_gam_prcp)
+```
+```{r}
+# Compare all the AIC scores 
+AIC(model_lm, model_gam, model_gam_week, model_gam_ehf,
+    model_gam_minmax, model_gam_prcp)
+```
+
+#### The End ####
+
+
